@@ -1,0 +1,1201 @@
+// ABW-BOS Prisma Schema
+// Implements kernel tables (identity, RBAC, audit, settings, notifications)
+// plus the contacts module (parties, addresses, contact methods).
+// Adapted from Volume 2 §2.2-2.5 to Prisma's DSL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// KERNEL: IDENTITY
+// ============================================================
+
+model User {
+  id              String   @id @default(cuid())
+  username        String   @unique
+  displayName     String
+  email           String?  @unique
+  passwordHash    String
+  mfaEnabled      Boolean  @default(false)
+  failedAttempts  Int      @default(0)
+  lockedUntil     DateTime?
+  isActive        Boolean  @default(true)
+  isSuperAdmin    Boolean  @default(false)
+  lastLoginAt     DateTime?
+  lastLoginIp     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  sessions        Session[]
+  userRoles       UserRole[]
+  auditEntries    AuditLog[]   @relation("AuditActor")
+  notifications   NotificationDelivery[]
+  ownedParties    Party[]
+  createdParties  Party[]      @relation("PartyCreatedBy")
+  settings        Setting[]
+
+  @@map("kernel_users")
+}
+
+model Session {
+  id              String   @id @default(cuid())
+  userId          String
+  token           String   @unique
+  issuedAt        DateTime @default(now())
+  expiresAt       DateTime
+  ipAddress       String?
+  userAgent       String?
+  revokedAt       DateTime?
+  revokeReason    String?
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("kernel_sessions")
+}
+
+// ============================================================
+// KERNEL: RBAC
+// ============================================================
+
+model Role {
+  id              String   @id @default(cuid())
+  code            String   @unique
+  name            String
+  description     String?
+  isSystem        Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  userRoles       UserRole[]
+  permissions     RolePermission[]
+
+  @@map("kernel_roles")
+}
+
+model UserRole {
+  id              String   @id @default(cuid())
+  userId          String
+  roleId          String
+  assignedAt      DateTime @default(now())
+  expiresAt       DateTime?
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role            Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@map("kernel_user_roles")
+}
+
+model Permission {
+  id              String   @id @default(cuid())
+  moduleId        String
+  resource        String
+  action          String
+  description     String?
+  createdAt       DateTime @default(now())
+
+  roles           RolePermission[]
+
+  @@unique([moduleId, resource, action])
+  @@map("kernel_permissions")
+}
+
+model RolePermission {
+  roleId          String
+  permissionId    String
+  assignedAt      DateTime @default(now())
+  role            Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission      Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("kernel_role_permissions")
+}
+
+// ============================================================
+// KERNEL: AUDIT LOG
+// ============================================================
+
+model AuditLog {
+  id              String   @id @default(cuid())
+  ts              DateTime @default(now())
+  traceId         String?
+  userId          String?
+  actorKind       String   @default("user") // user | system | plugin | sync
+  actorId         String
+  module          String
+  entityType      String
+  entityId        String
+  action          String   // create | update | delete | transition | read | export | print | login | logout
+  beforeState     String?  // JSON
+  afterState      String?  // JSON
+  diff            String?  // JSON
+  reason          String?
+  source          String   @default("ui") // ui | api | sync | plugin | system | scheduled
+  sourceIp        String?
+  user            User?    @relation("AuditActor", fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([module, entityType, entityId])
+  @@index([userId])
+  @@index([ts])
+  @@index([action])
+  @@map("kernel_audit_log")
+}
+
+// ============================================================
+// KERNEL: SETTINGS (hierarchical)
+// ============================================================
+
+model Setting {
+  id              String   @id @default(cuid())
+  scope           String   // system | tenant | user | module
+  userId          String?
+  moduleId        String?
+  key             String
+  value           String   // JSON-encoded
+  valueType       String   // string | number | boolean | object | array
+  updatedAt       DateTime @updatedAt
+  user            User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([scope, userId, moduleId, key])
+  @@index([scope, moduleId, key])
+  @@map("kernel_settings")
+}
+
+// ============================================================
+// KERNEL: NOTIFICATIONS
+// ============================================================
+
+model Notification {
+  id              String   @id @default(cuid())
+  type            String   // transactional | workflow | system | reminder
+  module          String
+  entityType      String?
+  entityId        String?
+  title           String
+  body            String
+  urgency         String   @default("medium") // low | medium | high | critical
+  actionLabel     String?
+  actionRoute     String?
+  createdAt       DateTime @default(now())
+  expiresAt       DateTime?
+
+  deliveries      NotificationDelivery[]
+
+  @@index([createdAt])
+  @@map("kernel_notifications")
+}
+
+model NotificationDelivery {
+  id              String   @id @default(cuid())
+  notificationId  String
+  userId          String
+  channel         String   @default("in_app") // in_app | os_native | email | webhook
+  status          String   @default("pending") // pending | delivered | read | actioned | dismissed | failed
+  deliveredAt     DateTime?
+  readAt          DateTime?
+  actionedAt      DateTime?
+  dismissedAt     DateTime?
+  snoozeUntil     DateTime?
+  notification    Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@map("kernel_notification_deliveries")
+}
+
+// ============================================================
+// MODULE: contacts
+// ============================================================
+
+model Party {
+  id              String   @id @default(cuid())
+  partyType       String   // person | organization
+  subTypes        String   @default("[]") // JSON array: ["customer","supplier",...]
+  displayName     String
+  legalName       String?
+  firstName       String?
+  lastName        String?
+  salutation      String?
+  email           String?
+  phone           String?
+  taxId           String?
+  taxIdType       String?
+  currencyCode    String   @default("INR")
+  creditLimit     Float?
+  paymentTermsDays Int?
+  isActive        Boolean  @default(true)
+  ownerId         String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  version         Int      @default(1)
+
+  owner           User?    @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+  creator         User?    @relation("PartyCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  addresses       Address[]
+  contactMethods  ContactMethod[]
+  invoices        Invoice[]
+  quotations      Quotation[]
+
+  @@index([displayName])
+  @@index([partyType, isActive])
+  @@index([ownerId])
+  @@map("contacts_parties")
+}
+
+model Address {
+  id              String   @id @default(cuid())
+  partyId         String
+  addressType     String   // billing | shipping | home | work | registered | other
+  line1           String
+  line2           String?
+  city            String
+  stateProvince   String?
+  postalCode      String?
+  countryCode     String   @default("IN")
+  isDefault       Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  party           Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+
+  @@index([partyId])
+  @@map("contacts_addresses")
+}
+
+model ContactMethod {
+  id              String   @id @default(cuid())
+  partyId         String
+  methodType      String   // email | phone | mobile | fax | website | other
+  value           String
+  label           String?
+  isDefault       Boolean  @default(false)
+  isVerified      Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  party           Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+
+  @@index([partyId])
+  @@map("contacts_contact_methods")
+}
+
+// ============================================================
+// MODULE: gl (General Ledger)
+// ============================================================
+
+model GlAccount {
+  id              String   @id @default(cuid())
+  code            String   @unique
+  name            String
+  accountType     String   // asset | liability | equity | revenue | expense
+  subType         String?  // current_asset | fixed_asset | current_liability | etc.
+  parentAccountId String?
+  isGroup         Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  currencyCode    String   @default("INR")
+  openingBalance  Float    @default(0)
+  description     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  parent          GlAccount? @relation("GlAccountHierarchy", fields: [parentAccountId], references: [id], onDelete: Restrict)
+  children        GlAccount[] @relation("GlAccountHierarchy")
+  journalLines    JournalLine[]
+
+  @@index([accountType, isActive])
+  @@index([parentAccountId])
+  @@map("gl_accounts")
+}
+
+model FiscalYear {
+  id              String   @id @default(cuid())
+  yearCode        String   @unique
+  startDate       DateTime
+  endDate         DateTime
+  isClosed        Boolean  @default(false)
+  closedAt        DateTime?
+  closedBy        String?
+  periods         FiscalPeriod[]
+
+  @@map("gl_fiscal_years")
+}
+
+model FiscalPeriod {
+  id              String   @id @default(cuid())
+  fiscalYearId    String
+  periodNumber    Int
+  periodCode      String   @unique
+  startDate       DateTime
+  endDate         DateTime
+  isClosed        Boolean  @default(false)
+  closedAt        DateTime?
+  closedBy        String?
+  fiscalYear      FiscalYear @relation(fields: [fiscalYearId], references: [id], onDelete: Cascade)
+  journalEntries  JournalEntry[]
+
+  @@index([startDate, endDate])
+  @@map("gl_fiscal_periods")
+}
+
+model JournalEntry {
+  id              String   @id @default(cuid())
+  entryNumber     String   @unique
+  entryDate       DateTime
+  periodId        String?
+  description     String?
+  referenceType   String?  // invoice | payment | manual
+  referenceId     String?
+  sourceModule    String?  // invoicing | payments | gl
+  status          String   @default("draft") // draft | posted | reversed | void
+  postedAt        DateTime?
+  postedBy        String?
+  totalDebit      Float    @default(0)
+  totalCredit     Float    @default(0)
+  isBalanced      Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  period          FiscalPeriod? @relation(fields: [periodId], references: [id], onDelete: Restrict)
+  lines           JournalLine[]
+
+  @@index([entryDate, status])
+  @@index([status, entryDate])
+  @@map("gl_journal_entries")
+}
+
+model JournalLine {
+  id              String   @id @default(cuid())
+  journalEntryId  String
+  lineNumber      Int
+  accountId       String
+  debitAmount     Float    @default(0)
+  creditAmount    Float    @default(0)
+  description     String?
+  partyId         String?
+  createdAt       DateTime @default(now())
+  journalEntry    JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account         GlAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  @@unique([journalEntryId, lineNumber])
+  @@index([accountId, createdAt])
+  @@index([partyId])
+  @@map("gl_journal_lines")
+}
+
+// ============================================================
+// MODULE: inventory
+// ============================================================
+
+model Product {
+  id              String   @id @default(cuid())
+  sku             String   @unique
+  barcode         String?
+  name            String
+  description     String?
+  category        String?
+  uom             String   @default("pcs") // unit of measure
+  productType     String   @default("goods") // goods | service | bundle
+  isStockable     Boolean  @default(true)
+  costPrice       Float    @default(0)
+  salePrice       Float    @default(0)
+  currencyCode    String   @default("INR")
+  taxCode         String?
+  reorderPoint    Int?
+  reorderQty      Int?
+  defaultSupplierId String?
+  imageFileId     String?
+  weightGrams     Int?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  stockEntries    Stock[]
+  movements       StockMovement[]
+  invoiceLines    InvoiceLine[]
+
+  @@index([name])
+  @@index([category, isActive])
+  @@index([barcode])
+  @@map("inventory_products")
+}
+
+model Warehouse {
+  id              String   @id @default(cuid())
+  code            String   @unique
+  name            String
+  address         String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  stockEntries    Stock[]
+  movements       StockMovement[]
+
+  @@map("inventory_warehouses")
+}
+
+model Stock {
+  id              String   @id @default(cuid())
+  productId       String
+  warehouseId     String
+  quantityOnHand  Float    @default(0)
+  quantityReserved Float   @default(0)
+  averageCost     Float    @default(0)
+  lastMovementAt  DateTime?
+  updatedAt       DateTime @updatedAt
+  product         Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse       Warehouse   @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, warehouseId])
+  @@index([productId])
+  @@map("inventory_stock")
+}
+
+model StockMovement {
+  id              String   @id @default(cuid())
+  movementNumber  String   @unique
+  movementDate    DateTime @default(now())
+  productId       String
+  warehouseId     String
+  movementType    String   // purchase_in | sale_out | adjustment_in | adjustment_out | transfer_in | transfer_out | opening_balance
+  quantity        Float    // positive = in, negative = out
+  unitCost        Float?
+  totalCost       Float?
+  referenceType   String?  // po | so | invoice | manual
+  referenceId     String?
+  notes           String?
+  balanceAfter    Float
+  createdAt       DateTime @default(now())
+  createdBy       String?
+  product         Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse       Warehouse   @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@index([productId, movementDate])
+  @@index([warehouseId, movementDate])
+  @@map("inventory_stock_movements")
+}
+
+// ============================================================
+// MODULE: invoicing
+// ============================================================
+
+model Invoice {
+  id              String   @id @default(cuid())
+  invoiceNumber   String   @unique
+  invoiceType     String   @default("tax_invoice") // tax_invoice | proforma | credit_note | debit_note
+  invoiceDate     DateTime @default(now())
+  dueDate         DateTime
+  partyId         String
+  currencyCode    String   @default("INR")
+  status          String   @default("draft") // draft | sent | viewed | partial | paid | overdue | void
+  subtotal        Float    @default(0)
+  discountAmount  Float    @default(0)
+  taxAmount       Float    @default(0)
+  totalAmount     Float    @default(0)
+  paidAmount      Float    @default(0)
+  balanceDue      Float    @default(0)
+  notes           String?
+  termsConditions String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  party           Party    @relation(fields: [partyId], references: [id], onDelete: Restrict)
+  lines           InvoiceLine[]
+
+  @@index([partyId, status, invoiceDate])
+  @@index([status, dueDate])
+  @@index([invoiceDate])
+  @@map("invoicing_invoices")
+}
+
+model InvoiceLine {
+  id              String   @id @default(cuid())
+  invoiceId       String
+  lineNumber      Int
+  productId       String?
+  description     String
+  quantity        Float
+  uom             String   @default("pcs")
+  unitPrice       Float
+  discountPercent Float    @default(0)
+  discountAmount  Float    @default(0)
+  taxPercent      Float    @default(0)
+  taxAmount       Float    @default(0)
+  lineTotal       Float
+  product         Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  invoice         Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, lineNumber])
+  @@index([invoiceId])
+  @@map("invoicing_invoice_lines")
+}
+
+// ============================================================
+// MODULE: transactions (income/expense tracking)
+// ============================================================
+
+model Transaction {
+  id              String   @id @default(cuid())
+  transactionNumber String @unique
+  type            String   // income | expense | transfer
+  category        String   // sales | purchase | salary | rent | utility | other
+  amount          Float
+  currencyCode    String   @default("INR")
+  transactionDate DateTime @default(now())
+  paymentMode     String   @default("cash") // cash | bank | upi | cheque | card
+  referenceType   String?  // invoice | party | manual
+  referenceId     String?
+  partyId         String?
+  accountId       String?  // GL account
+  description     String?
+  notes           String?
+  status          String   @default("completed") // pending | completed | reconciled | void
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([type, transactionDate])
+  @@index([category, transactionDate])
+  @@index([partyId])
+  @@index([status])
+  @@map("transactions_transactions")
+}
+
+// ============================================================
+// MODULE: team (team members)
+// ============================================================
+
+model TeamMember {
+  id              String   @id @default(cuid())
+  name            String
+  email           String?  @unique
+  phone           String?
+  role            String   @default("member") // lead | manager | member
+  department      String?  // sales | operations | finance | hr | tech
+  designation     String?
+  avatarColor     String   @default("#1B6D97")
+  skills          String   @default("[]") // JSON array
+  isActive        Boolean  @default(true)
+  joinedAt        DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  assignedTasks   Task[]   @relation("TaskAssignee")
+
+  @@index([department, isActive])
+  @@index([role])
+  @@map("team_members")
+}
+
+// ============================================================
+// MODULE: scrum (projects, sprints, tasks)
+// ============================================================
+
+model ScrumProject {
+  id              String   @id @default(cuid())
+  name            String
+  description     String?
+  status          String   @default("planning") // planning | active | on_hold | completed | cancelled
+  priority        String   @default("medium") // low | medium | high | critical
+  startDate       DateTime?
+  endDate         DateTime?
+  budget          Float?
+  progress        Int      @default(0) // 0-100
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  sprints         Sprint[]
+  tasks           Task[]
+
+  @@index([status, priority])
+  @@map("scrum_projects")
+}
+
+model Sprint {
+  id              String   @id @default(cuid())
+  projectId       String
+  name            String
+  goal            String?
+  status          String   @default("planned") // planned | active | completed | cancelled
+  startDate       DateTime
+  endDate         DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  project         ScrumProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks           Task[]
+
+  @@index([projectId, status])
+  @@map("scrum_sprints")
+}
+
+model Task {
+  id              String   @id @default(cuid())
+  projectId       String
+  sprintId        String?
+  title           String
+  description     String?
+  status          String   @default("todo") // todo | in_progress | review | done | blocked
+  priority        String   @default("medium") // low | medium | high | urgent
+  type            String   @default("task") // task | bug | story | epic
+  storyPoints     Int?
+  assigneeId      String?
+  dueDate         DateTime?
+  estimatedHours  Float?
+  actualHours     Float?
+  tags            String   @default("[]") // JSON array
+  order           Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  project         ScrumProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sprint          Sprint?      @relation(fields: [sprintId], references: [id], onDelete: SetNull)
+  assignee        TeamMember?  @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, status])
+  @@index([sprintId, status])
+  @@index([assigneeId])
+  @@index([priority, dueDate])
+  @@map("scrum_tasks")
+}
+
+// ============================================================
+// MODULE: schedules (daily calendar)
+// ============================================================
+
+model Schedule {
+  id              String   @id @default(cuid())
+  title           String
+  description     String?
+  type            String   @default("meeting") // meeting | call | task | appointment | reminder | break
+  startDate       DateTime
+  endDate         DateTime
+  allDay          Boolean  @default(false)
+  location        String?
+  attendees       String   @default("[]") // JSON array of names
+  partyId         String?  // linked contact
+  status          String   @default("scheduled") // scheduled | in_progress | completed | cancelled | no_show
+  priority        String   @default("medium") // low | medium | high
+  color           String   @default("#1B6D97")
+  reminderMinutes Int?     // reminder before start
+  notes           String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([startDate, endDate])
+  @@index([type, status])
+  @@index([status, startDate])
+  @@map("schedules_events")
+}
+
+// ============================================================
+// MODULE: notes
+// ============================================================
+
+model Note {
+  id              String   @id @default(cuid())
+  title           String
+  content         String   @default("") // markdown content
+  notebookId      String?  // optional notebook grouping
+  tags            String   @default("[]") // JSON array
+  color           String   @default("#FFFFFF")
+  isPinned        Boolean  @default(false)
+  isArchived      Boolean  @default(false)
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([isPinned, updatedAt])
+  @@index([isArchived])
+  @@map("notes_notes")
+}
+
+model Notebook {
+  id              String   @id @default(cuid())
+  name            String
+  description     String?
+  color           String   @default("#1B6D97")
+  icon            String   @default("book")
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@map("notes_notebooks")
+}
+
+// ============================================================
+// MODULE: quotations
+// ============================================================
+
+model Quotation {
+  id              String   @id @default(cuid())
+  quotationNumber String   @unique
+  partyId         String
+  quotationDate   DateTime @default(now())
+  validUntil      DateTime
+  currencyCode    String   @default("INR")
+  status          String   @default("draft") // draft | sent | accepted | rejected | expired | converted
+  subtotal        Float    @default(0)
+  discountAmount  Float    @default(0)
+  taxAmount       Float    @default(0)
+  totalAmount     Float    @default(0)
+  notes           String?
+  termsConditions String?
+  convertedInvoiceId String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+  party           Party    @relation(fields: [partyId], references: [id], onDelete: Restrict)
+  lines           QuotationLine[]
+
+  @@index([partyId, status])
+  @@index([status, validUntil])
+  @@map("quotations_quotations")
+}
+
+model QuotationLine {
+  id              String   @id @default(cuid())
+  quotationId     String
+  lineNumber      Int
+  productId       String?
+  description     String
+  quantity        Float
+  uom             String   @default("pcs")
+  unitPrice       Float
+  discountPercent Float    @default(0)
+  taxPercent      Float    @default(0)
+  taxAmount       Float    @default(0)
+  lineTotal       Float
+  quotation       Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  @@unique([quotationId, lineNumber])
+  @@index([quotationId])
+  @@map("quotations_lines")
+}
+
+// ============================================================
+// MODULE: advisory (AI advisory sessions)
+// ============================================================
+
+model AdvisorySession {
+  id              String   @id @default(cuid())
+  topic           String
+  category        String   @default("general") // financial | operational | strategic | compliance | growth
+  question        String
+  answer          String   @default("")
+  followUpQuestions String @default("[]") // JSON array
+  insights        String   @default("[]") // JSON array of insight strings
+  recommendations String   @default("[]") // JSON array
+  rating          Int?     // 1-5 user rating
+  feedback        String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([category, createdAt])
+  @@index([createdBy])
+  @@map("advisory_sessions")
+}
+
+// ============================================================
+// MODULE: payroll (salary slips)
+// ============================================================
+
+model SalarySlip {
+  id              String   @id @default(cuid())
+  slipNumber      String   @unique
+  employeeName    String
+  employeeId      String?
+  payPeriod       String   // "2026-07" format
+  payDate         DateTime @default(now())
+  basicSalary     Float    @default(0)
+  hraAllowance    Float    @default(0)
+  conveyance      Float    @default(0)
+  medicalAllowance Float   @default(0)
+  specialAllowance Float   @default(0)
+  otherAllowances Float    @default(0)
+  grossEarnings   Float    @default(0)
+  pfDeduction     Float    @default(0)
+  esiDeduction    Float    @default(0)
+  tdsDeduction    Float    @default(0)
+  professionalTax Float    @default(0)
+  otherDeductions Float    @default(0)
+  totalDeductions Float    @default(0)
+  netPay          Float    @default(0)
+  currencyCode    String   @default("INR")
+  status          String   @default("draft") // draft | processed | paid
+  bankAccount     String?
+  notes           String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([employeeName, payPeriod])
+  @@index([payPeriod, status])
+  @@map("payroll_salary_slips")
+}
+
+// ============================================================
+// MODULE: gst (tax filing)
+// ============================================================
+
+model GstFiling {
+  id              String   @id @default(cuid())
+  filingNumber    String   @unique
+  returnType      String   // gstr1 | gstr3b | gstr9
+  period          String   // "2026-07"
+  dueDate         DateTime
+  filingDate      DateTime?
+  status          String   @default("pending") // pending | filed | late_filed
+  totalTaxableValue Float  @default(0)
+  totalOutputTax  Float    @default(0)
+  totalInputTax   Float    @default(0)
+  netTaxPayable   Float    @default(0)
+  igstAmount      Float    @default(0)
+  cgstAmount      Float    @default(0)
+  sgstAmount      Float    @default(0)
+  cessAmount      Float    @default(0)
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([returnType, period])
+  @@index([status, dueDate])
+  @@map("gst_filings")
+}
+
+// ============================================================
+// MODULE: bills (vendor bills / payable tracking)
+// ============================================================
+
+model Bill {
+  id              String   @id @default(cuid())
+  billNumber      String   @unique
+  vendorName      String
+  vendorId        String?
+  billDate        DateTime @default(now())
+  dueDate         DateTime
+  amount          Float
+  taxAmount       Float    @default(0)
+  totalAmount     Float    @default(0)
+  paidAmount      Float    @default(0)
+  balanceDue      Float    @default(0)
+  currencyCode    String   @default("INR")
+  status          String   @default("unpaid") // unpaid | partial | paid | overdue
+  category        String   @default("other") // utility | rent | supplies | service | other
+  paymentDate     DateTime?
+  notes           String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([vendorName, status])
+  @@index([status, dueDate])
+  @@map("bills_bills")
+}
+
+// ============================================================
+// MODULE: payments (payment records)
+// ============================================================
+
+model PaymentRecord {
+  id              String   @id @default(cuid())
+  paymentNumber   String   @unique
+  type            String   // received | made
+  partyName       String
+  partyId         String?
+  amount          Float
+  currencyCode    String   @default("INR")
+  paymentDate     DateTime @default(now())
+  paymentMode     String   @default("bank") // cash | bank | upi | cheque | card
+  referenceNumber String?
+  invoiceNumber   String?
+  invoiceId       String?
+  billNumber      String?
+  billId          String?
+  status          String   @default("completed") // pending | completed | failed | reversed
+  notes           String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([type, paymentDate])
+  @@index([partyName])
+  @@index([status])
+  @@map("payments_records")
+}
+
+// ============================================================
+// MODULE: company profile (letterhead, logo, templates)
+// ============================================================
+
+model CompanyProfile {
+  id              String   @id @default("default")
+  companyName     String   @default("ABWcurious")
+  tagline         String?
+  logoUrl         String?
+  letterheadUrl   String?
+  addressLine1    String?
+  addressLine2    String?
+  city            String?
+  stateProvince   String?
+  postalCode      String?
+  countryCode     String   @default("IN")
+  phone           String?
+  email           String?
+  website         String?
+  taxId           String?
+  taxIdType       String   @default("GST")
+  bankName        String?
+  bankAccount     String?
+  bankIfsc        String?
+  bankBranch      String?
+  upiId           String?
+  signatureUrl    String?
+  defaultFont     String   @default("Times New Roman")
+  primaryColor    String   @default("#1B6D97")
+  invoicePrefix   String   @default("INV")
+  quotationPrefix String   @default("QUO")
+  invoiceTerms    String?
+  quotationTerms  String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("company_profile")
+}
+
+model DocumentTemplate {
+  id              String   @id @default(cuid())
+  type            String   // invoice | quotation | report | letter
+  name            String
+  content         String   @default("") // HTML template with placeholders
+  headerHtml      String?
+  footerHtml      String?
+  css             String?
+  isDefault       Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([type, isActive])
+  @@map("document_templates")
+}
+
+// ============================================================
+// MODULE: HR — Employees, Interns, Courses, Placements, Letters, Certifications
+// ============================================================
+
+model Employee {
+  id              String   @id @default(cuid())
+  employeeCode    String   @unique
+  fullName        String
+  email           String?  @unique
+  phone           String?
+  dateOfBirth     DateTime?
+  gender          String?
+  bloodGroup      String?
+  maritalStatus   String?
+  nationality     String   @default("Indian")
+  address         String?
+  city            String?
+  state           String?
+  pincode         String?
+  emergencyContact String?
+  emergencyPhone  String?
+  department      String?
+  designation     String?
+  employmentType  String   @default("full-time")
+  joiningDate     DateTime @default(now())
+  exitDate        DateTime?
+  status          String   @default("active")
+  reportingManager String?
+  workLocation    String?
+  shiftTiming     String?
+  avatarUrl       String?
+  basicSalary     Float    @default(0)
+  bankName        String?
+  bankAccount     String?
+  bankIfsc        String?
+  pfNumber        String?
+  esiNumber       String?
+  panNumber       String?
+  aadhaarNumber   String?
+  uanNumber       String?
+  documents       String   @default("[]")
+  certifications  String   @default("[]")
+  courses         String   @default("[]")
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([department, status])
+  @@index([employmentType])
+  @@map("hr_employees")
+}
+
+model Intern {
+  id              String   @id @default(cuid())
+  internCode      String   @unique
+  fullName        String
+  email           String?  @unique
+  phone           String?
+  dateOfBirth     DateTime?
+  gender          String?
+  address         String?
+  city            String?
+  state           String?
+  pincode         String?
+  college         String?
+  degree          String?
+  branch          String?
+  year            String?
+  position        String
+  department      String?
+  mentorId        String?
+  startDate       DateTime @default(now())
+  endDate         DateTime?
+  duration        String?
+  stipend         Float    @default(0)
+  status          String   @default("active")
+  resumeUrl       String?
+  offerLetterUrl  String?
+  certificateUrl  String?
+  documents       String   @default("[]")
+  performance     String?
+  evaluationNotes String?
+  convertedToEmployee Boolean @default(false)
+  employeeId      String?
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([status, department])
+  @@map("hr_interns")
+}
+
+model Course {
+  id              String   @id @default(cuid())
+  courseCode      String   @unique
+  title           String
+  description     String?
+  category        String?
+  provider        String?
+  duration        String?
+  mode            String   @default("online")
+  cost            Float    @default(0)
+  certificate     Boolean  @default(true)
+  maxParticipants Int?
+  startDate       DateTime?
+  endDate         DateTime?
+  status          String   @default("available")
+  syllabus        String?
+  instructor      String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([category, status])
+  @@map("hr_courses")
+}
+
+model Placement {
+  id              String   @id @default(cuid())
+  placementCode   String   @unique
+  internId        String?
+  employeeId      String?
+  candidateName   String
+  candidateEmail  String?
+  candidatePhone  String?
+  companyName     String
+  position        String
+  location        String?
+  salary          Float?
+  placementDate   DateTime @default(now())
+  status          String   @default("pending")
+  interviewDate   DateTime?
+  interviewResult String?
+  offerLetterUrl  String?
+  joiningLetterUrl String?
+  commissionAmount Float  @default(0)
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([status, placementDate])
+  @@map("hr_placements")
+}
+
+model Letter {
+  id              String   @id @default(cuid())
+  letterNumber    String   @unique
+  letterType      String
+  recipientName   String
+  recipientEmail  String?
+  recipientAddress String?
+  subject         String
+  body            String   @default("")
+  content         String   @default("")
+  employeeId      String?
+  internId        String?
+  issueDate       DateTime @default(now())
+  validFrom       DateTime?
+  validUntil      DateTime?
+  status          String   @default("draft")
+  signedBy        String?
+  signatureUrl    String?
+  pdfUrl          String?
+  notes           String?
+  createdBy       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  @@index([letterType, status])
+  @@index([recipientName])
+  @@map("hr_letters")
+}
+
+model Certification {
+  id              String   @id @default(cuid())
+  certCode        String   @unique
+  title           String
+  description     String?
+  issuingBody     String
+  issueDate       DateTime
+  expiryDate      DateTime?
+  credentialId    String?
+  credentialUrl   String?
+  holderType      String   @default("employee")
+  holderId        String?
+  holderName      String
+  certificateUrl  String?
+  status          String   @default("valid")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([holderType, holderId])
+  @@index([status, expiryDate])
+  @@map("hr_certifications")
+}
